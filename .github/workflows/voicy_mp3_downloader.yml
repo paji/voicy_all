@@ -1,0 +1,520 @@
+name: Voicy MP3 Downloader
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 毎日0時に実行
+  workflow_dispatch:  # 手動実行用
+
+# 明示的に権限を設定
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  voicy-mp3-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # タイムアウト時間を30分に設定
+    
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v3
+      
+      - name: Python 3.10 セットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Chrome ブラウザのセットアップ
+        uses: browser-actions/setup-chrome@v1
+      
+      - name: FFmpegのインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+      
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 selenium webdriver-manager
+
+      - name: キャッシュの復元
+        uses: actions/cache@v3
+        with:
+          path: |
+            mp3_downloads
+            episodes.json
+          key: ${{ runner.os }}-voicy-${{ hashFiles('episodes.json') }}
+          restore-keys: |
+            ${{ runner.os }}-voicy-
+
+      - name: ディレクトリ作成
+        run: |
+          mkdir -p mp3_downloads
+          mkdir -p temp_segments
+          mkdir -p debug_files
+      
+      - name: エピソード一覧取得スクリプト作成
+        run: |
+          cat > list_episodes.py << 'EOF'
+          import os
+          import re
+          import json
+          import time
+          from datetime import datetime
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+          from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+          # Voicyチャンネル情報
+          CHANNEL_ID = "2834"  # パジ郎チャンネル
+          CHANNEL_URL = f"https://voicy.jp/channel/{CHANNEL_ID}/all"  # チャンネル全放送一覧ページ
+
+          # 取得するエピソード数
+          MAX_EPISODES = 15  # 15件に変更
+
+          # 出力ファイル
+          OUTPUT_FILE = "episodes.json"
+
+          def setup_driver():
+              """Seleniumドライバーのセットアップ"""
+              chrome_options = Options()
+              chrome_options.add_argument("--headless")  # ヘッドレスモードで実行
+              chrome_options.add_argument("--no-sandbox")
+              chrome_options.add_argument("--disable-dev-shm-usage")
+              chrome_options.add_argument("--disable-gpu")
+              chrome_options.add_argument("--window-size=1920,1080")
+              
+              driver = webdriver.Chrome(options=chrome_options)
+              driver.set_page_load_timeout(30)
+              return driver
+
+          def get_all_episodes(driver, max_episodes=MAX_EPISODES):
+              """すべてのエピソード情報を取得"""
+              print(f"チャンネルURL: {CHANNEL_URL}")
+              driver.get(CHANNEL_URL)
+              
+              # ページが完全に読み込まれるまで待機
+              try:
+                  WebDriverWait(driver, 10).until(
+                      EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/channel/'][href*='/']"))
+                  )
+              except TimeoutException:
+                  print("ページの読み込みタイムアウト")
+                  return []
+              
+              episodes = []
+              episode_ids_seen = set()
+              scroll_count = 0
+              max_scroll_attempts = 30  # スクロール試行回数をさらに減らす
+              
+              # 年月フィルターがあれば「すべての年月」を選択
+              try:
+                  month_filter = driver.find_element(By.XPATH, "//button[contains(text(), 'すべての年月')]")
+                  month_filter.click()
+                  time.sleep(1)
+              except NoSuchElementException:
+                  print("年月フィルターが見つかりませんでした")
+              
+              print("エピソード情報の取得を開始します...")
+              
+              # スクロールしながらエピソードを取得
+              last_height = driver.execute_script("return document.body.scrollHeight")
+              
+              while len(episodes) < max_episodes and scroll_count < max_scroll_attempts:
+                  # エピソードリンクを取得
+                  episode_elements = driver.find_elements(By.CSS_SELECTOR, "a[href*='/channel/'][href*='/']")
+                  
+                  for element in episode_elements:
+                      try:
+                          href = element.get_attribute("href")
+                          if not href:
+                              continue
+                          
+                          # エピソードIDを抽出
+                          match = re.search(r'/channel/\d+/(\d+)', href)
+                          if match:
+                              episode_id = match.group(1)
+                              
+                              # 重複チェック
+                              if episode_id in episode_ids_seen:
+                                  continue
+                              
+                              episode_ids_seen.add(episode_id)
+                              
+                              # 親要素を取得してタイトルと日付を探す
+                              parent = element
+                              for _ in range(3):  # 親階層を減らす
+                                  try:
+                                      parent = parent.find_element(By.XPATH, "..")
+                                      if "episode" in parent.get_attribute("class") or "broadcast" in parent.get_attribute("class"):
+                                          break
+                                  except:
+                                      break
+                              
+                              # タイトル取得
+                              title = ""
+                              try:
+                                  title_element = parent.find_element(By.CSS_SELECTOR, "h2, h3, .title, .episode-title")
+                                  title = title_element.text
+                              except:
+                                  try:
+                                      # 別の方法でタイトルを取得
+                                      title = element.text
+                                  except:
+                                      pass
+                              
+                              if not title:
+                                  title = f"エピソード {episode_id}"
+                              
+                              # 日付取得
+                              date_str = ""
+                              try:
+                                  date_element = parent.find_element(By.CSS_SELECTOR, "time, .date, .episode-date")
+                                  date_str = date_element.text
+                              except:
+                                  pass
+                              
+                              # 音声URLはこの段階では取得せず、エピソードIDのみ保存
+                              episode_info = {
+                                  "id": episode_id,
+                                  "title": title,
+                                  "date": date_str,
+                                  "url": href
+                              }
+                              
+                              episodes.append(episode_info)
+                              print(f"エピソード追加: {title} (ID: {episode_id})")
+                              
+                              if len(episodes) >= max_episodes:
+                                  break
+                      except Exception as e:
+                          print(f"エピソード情報取得中にエラー: {str(e)}")
+                  
+                  if len(episodes) >= max_episodes:
+                      break
+                  
+                  # ページをスクロール
+                  driver.execute_script("window.scrollBy(0, 1000);")
+                  time.sleep(0.5)  # スクロール後の待機時間を短縮
+                  
+                  # スクロールが効かなくなったかチェック
+                  new_height = driver.execute_script("return document.body.scrollHeight")
+                  scroll_count += 1
+                  
+                  print(f"スクロール回数: {scroll_count}, 取得エピソード数: {len(episodes)}")
+                  
+                  if new_height == last_height:
+                      # 同じ高さなら終了
+                      print("これ以上スクロールできないため終了します")
+                      break
+                  
+                  last_height = new_height
+                  
+                  # 十分なエピソードが取得できたら早期終了
+                  if len(episodes) >= max_episodes:
+                      print(f"目標エピソード数 {max_episodes} に達したため終了します")
+                      break
+              
+              print(f"合計 {len(episodes)} 件のエピソードを取得しました")
+              return episodes
+
+          def save_episodes_to_file(episodes, filename=OUTPUT_FILE):
+              """エピソード情報をJSONファイルに保存"""
+              with open(filename, 'w', encoding='utf-8') as f:
+                  json.dump(episodes, f, ensure_ascii=False, indent=2)
+              print(f"エピソード情報を {filename} に保存しました")
+
+          def main():
+              """メイン処理"""
+              start_time = datetime.now()
+              print(f"処理開始: {start_time}")
+              
+              driver = setup_driver()
+              try:
+                  episodes = get_all_episodes(driver)
+                  save_episodes_to_file(episodes)
+              finally:
+                  driver.quit()
+              
+              end_time = datetime.now()
+              print(f"処理終了: {end_time}")
+              print(f"処理時間: {end_time - start_time}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: ダウンロードスクリプト作成
+        run: |
+          cat > download_episodes.py << 'EOF'
+          import os
+          import re
+          import json
+          import time
+          import requests
+          import subprocess
+          import traceback
+          import shutil
+          from datetime import datetime
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+          from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+          # Voicyチャンネル情報
+          CHANNEL_ID = "2834"  # パジ郎チャンネル
+          CHANNEL_URL = f"https://voicy.jp/channel/{CHANNEL_ID}"  # チャンネルトップページ
+
+          # ディレクトリ設定
+          MP3_DIR = "mp3_downloads"
+          TEMP_DIR = "temp_segments"
+          DEBUG_DIR = "debug_files"
+
+          # エピソード情報ファイル
+          EPISODES_FILE = "episodes.json"
+
+          def setup_directories():
+              """必要なディレクトリを作成"""
+              for directory in [MP3_DIR, TEMP_DIR, DEBUG_DIR]:
+                  os.makedirs(directory, exist_ok=True)
+                  print(f"ディレクトリを確認/作成しました: {directory}")
+
+          def setup_driver():
+              """Seleniumドライバーのセットアップ"""
+              chrome_options = Options()
+              chrome_options.add_argument("--headless")  # ヘッドレスモードで実行
+              chrome_options.add_argument("--no-sandbox")
+              chrome_options.add_argument("--disable-dev-shm-usage")
+              chrome_options.add_argument("--disable-gpu")
+              chrome_options.add_argument("--window-size=1920,1080")
+              
+              driver = webdriver.Chrome(options=chrome_options)
+              driver.set_page_load_timeout(30)
+              return driver
+
+          def get_audio_url(driver, episode_id):
+              """エピソードページから音声URLを取得"""
+              episode_url = f"{CHANNEL_URL}/{episode_id}"
+              print(f"音声URL取得: {episode_url}")
+              
+              try:
+                  driver.get(episode_url)
+                  
+                  # ページが完全に読み込まれるまで待機
+                  try:
+                      WebDriverWait(driver, 10).until(
+                          EC.presence_of_element_located((By.TAG_NAME, "audio"))
+                      )
+                  except TimeoutException:
+                      print("ページの読み込みタイムアウト")
+                      return None
+                  
+                  # JavaScriptを実行して音声URLを取得
+                  audio_url = driver.execute_script("""
+                      var audioElement = document.querySelector('audio');
+                      if (audioElement && audioElement.src) {
+                          return audioElement.src;
+                      }
+                      
+                      // audioタグがない場合はページ内のJavaScriptから探す
+                      var scripts = document.querySelectorAll('script');
+                      for (var i = 0; i < scripts.length; i++) {
+                          var content = scripts[i].textContent;
+                          if (content) {
+                              // m3u8またはmp3のURLを探す
+                              var m3u8Match = content.match(/"(https?:[^"]+\\.m3u8[^"]*)"/);
+                              if (m3u8Match) return m3u8Match[1];
+                              
+                              var mp3Match = content.match(/"(https?:[^"]+\\.mp3[^"]*)"/);
+                              if (mp3Match) return mp3Match[1];
+                          }
+                      }
+                      return null;
+                  """)
+                  
+                  if audio_url:
+                      print(f"音声URLを取得しました: {audio_url}")
+                      return audio_url
+                  else:
+                      print("音声URLが見つかりませんでした")
+                      return None
+              
+              except Exception as e:
+                  print(f"音声URL取得中にエラーが発生しました: {str(e)}")
+                  return None
+
+          def download_m3u8_to_mp3(m3u8_url, mp3_path, episode_id):
+              """m3u8からMP3をダウンロード"""
+              print(f"MP3ダウンロード: {m3u8_url}")
+              
+              try:
+                  # URLの拡張子を確認
+                  is_m3u8 = '.m3u8' in m3u8_url.lower()
+                  is_mp3 = '.mp3' in m3u8_url.lower()
+                  
+                  # MP3の場合は直接ダウンロード
+                  if is_mp3:
+                      print(f"MP3ファイルを直接ダウンロードします")
+                      try:
+                          response = requests.get(m3u8_url, timeout=30)
+                          if response.status_code == 200:
+                              with open(mp3_path, 'wb') as f:
+                                  f.write(response.content)
+                              
+                              if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                                  file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
+                                  print(f"MP3ファイルのダウンロードに成功しました: {mp3_path} (サイズ: {file_size_mb:.2f}MB)")
+                                  return mp3_path
+                              else:
+                                  print(f"MP3ファイルが正常にダウンロードされませんでした")
+                          else:
+                              print(f"MP3ファイルのダウンロードに失敗しました: ステータスコード {response.status_code}")
+                      except Exception as e:
+                          print(f"MP3ファイルのダウンロード中にエラーが発生しました: {str(e)}")
+                  
+                  # m3u8ファイルの場合
+                  if is_m3u8:
+                      # 方法1: 直接FFmpegを使用してURLからMP3に変換
+                      print("FFmpegを使用してURLからMP3に変換")
+                      try:
+                          cmd1 = [
+                              'ffmpeg',
+                              '-i', m3u8_url,
+                              '-c:a', 'libmp3lame',
+                              '-q:a', '2',
+                              '-y',
+                              mp3_path
+                          ]
+                          print(f"FFmpegコマンドを実行: {' '.join(cmd1)}")
+                          result1 = subprocess.run(cmd1, capture_output=True, text=True)
+                          
+                          if result1.returncode == 0:
+                              print(f"MP3ファイルの作成に成功しました: {mp3_path}")
+                              if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                                  file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
+                                  print(f"MP3ファイル: {mp3_path} (サイズ: {file_size_mb:.2f}MB)")
+                                  return mp3_path
+                              else:
+                                  print(f"MP3ファイルが正常に作成されませんでした")
+                          else:
+                              print(f"FFmpegエラー: {result1.stderr}")
+                      except Exception as e:
+                          print(f"MP3変換中にエラーが発生しました: {str(e)}")
+                  
+                  print(f"MP3変換に失敗しました")
+                  return None
+              
+              except Exception as e:
+                  print(f"MP3ダウンロード中に予期しないエラーが発生しました: {str(e)}")
+                  return None
+
+          def process_episodes(episodes, start_index=0, max_episodes=None):
+              """エピソードリストを処理してMP3をダウンロード"""
+              if max_episodes is None:
+                  max_episodes = len(episodes)
+              
+              end_index = min(start_index + max_episodes, len(episodes))
+              episodes_to_process = episodes[start_index:end_index]
+              
+              print(f"処理するエピソード数: {len(episodes_to_process)}")
+              
+              driver = setup_driver()
+              try:
+                  for i, episode in enumerate(episodes_to_process):
+                      episode_id = episode["id"]
+                      title = episode["title"]
+                      date_str = episode.get("date", "")
+                      
+                      # ファイル名を作成（日付_タイトル_ID.mp3）
+                      # ファイル名に使えない文字を置換
+                      safe_title = re.sub(r'[\\/*?:"<>|]', '_', title)
+                      safe_date = re.sub(r'[\\/*?:"<>|]', '_', date_str)
+                      
+                      if safe_date:
+                          mp3_filename = f"{safe_date}_{safe_title}_{episode_id}.mp3"
+                      else:
+                          mp3_filename = f"{safe_title}_{episode_id}.mp3"
+                      
+                      mp3_path = os.path.join(MP3_DIR, mp3_filename)
+                      
+                      # すでにダウンロード済みの場合はスキップ
+                      if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                          print(f"[{i+1}/{len(episodes_to_process)}] すでにダウンロード済み: {mp3_path}")
+                          continue
+                      
+                      print(f"[{i+1}/{len(episodes_to_process)}] 処理中: {title} (ID: {episode_id})")
+                      
+                      # 音声URLを取得
+                      audio_url = get_audio_url(driver, episode_id)
+                      if not audio_url:
+                          print(f"音声URLの取得に失敗しました: {episode_id}")
+                          continue
+                      
+                      # MP3をダウンロード
+                      result = download_m3u8_to_mp3(audio_url, mp3_path, episode_id)
+                      if result:
+                          print(f"MP3のダウンロードに成功しました: {mp3_path}")
+                      else:
+                          print(f"MP3のダウンロードに失敗しました: {episode_id}")
+              
+              finally:
+                  driver.quit()
+
+          def main():
+              """メイン処理"""
+              start_time = datetime.now()
+              print(f"処理開始: {start_time}")
+              
+              # ディレクトリを準備
+              setup_directories()
+              
+              # エピソード情報を読み込む
+              if not os.path.exists(EPISODES_FILE):
+                  print(f"エピソード情報ファイルが見つかりません: {EPISODES_FILE}")
+                  return
+              
+              with open(EPISODES_FILE, 'r', encoding='utf-8') as f:
+                  episodes = json.load(f)
+              
+              print(f"読み込んだエピソード数: {len(episodes)}")
+              
+              # エピソードを処理
+              process_episodes(episodes)
+              
+              end_time = datetime.now()
+              print(f"処理終了: {end_time}")
+              print(f"処理時間: {end_time - start_time}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: エピソード一覧の取得
+        run: python list_episodes.py
+        timeout-minutes: 5  # エピソード一覧取得のタイムアウトを5分に設定
+
+      - name: MP3ファイルのダウンロード
+        run: python download_episodes.py
+        timeout-minutes: 20  # MP3ダウンロードのタイムアウトを20分に設定
+        
+      - name: ダウンロード結果の確認
+        run: |
+          echo "ダウンロードしたMP3ファイル数: $(ls -1 mp3_downloads/*.mp3 2>/dev/null | wc -l || echo '0')"
+          echo "合計サイズ: $(du -sh mp3_downloads || echo '0')"
+      
+      - name: 変更をコミット
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          git add episodes.json || true
+          git add mp3_downloads/*.mp3 || true
+          git commit -m "Update Voicy MP3 files $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git push || echo "No changes to push"
