@@ -1,0 +1,206 @@
+import requests
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+import datetime
+import time
+import os
+import re
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+def scrape_voicy_channel(channel_id, output_file):
+    """
+    Scrape broadcasts from a Voicy.jp channel and save the data as XML.
+    
+    Args:
+        channel_id (str): The ID of the Voicy.jp channel to scrape.
+        output_file (str): The path to save the XML output.
+    """
+    base_url = f"https://voicy.jp/channel/{channel_id}/all"
+    broadcasts = []
+    
+    logger.info(f"Starting to scrape channel {channel_id} from {base_url}")
+    
+    # Make initial request
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
+    
+    try:
+        response = session.get(base_url)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error making request to {base_url}: {e}")
+        return
+    
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Try to find pagination
+    pagination_items = soup.select('ul.pagination li a')
+    if pagination_items:
+        page_numbers = []
+        for item in pagination_items:
+            href = item.get('href', '')
+            if href:
+                match = re.search(r'page=(\d+)', href)
+                if match:
+                    page_numbers.append(int(match.group(1)))
+        
+        total_pages = max(page_numbers) if page_numbers else 1
+    else:
+        total_pages = 1
+    
+    logger.info(f"Found {total_pages} pages to scrape")
+    
+    for page in range(1, total_pages + 1):
+        page_url = f"{base_url}?page={page}" if page > 1 else base_url
+        logger.info(f"Scraping page {page}/{total_pages}: {page_url}")
+        
+        try:
+            response = session.get(page_url)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error making request to {page_url}: {e}")
+            continue
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for broadcast elements
+        # Voicy.jp typically uses either articles or divs with specific classes for broadcasts
+        broadcast_elements = soup.select('article.episode, div.episode-item, div.broadcast-card')
+        
+        if not broadcast_elements:
+            # If we can't find by specific classes, try a more generic approach
+            # Look for containers that have links to broadcasts
+            broadcast_links = soup.select(f'a[href*="/channel/{channel_id}/"]')
+            broadcast_elements = [link.find_parent('div', class_=lambda c: c and ('episode' in c or 'broadcast' in c or 'card' in c)) 
+                                for link in broadcast_links if '/all' not in link.get('href', '')]
+            broadcast_elements = [elem for elem in broadcast_elements if elem]
+        
+        logger.info(f"Found {len(broadcast_elements)} potential broadcasts on page {page}")
+        
+        for elem in broadcast_elements:
+            broadcast_data = {}
+            
+            # Extract URL and title
+            link = elem.select_one('a[href*="/channel/"]')
+            if link and '/all' not in link.get('href', ''):
+                url = link.get('href', '')
+                if url.startswith('/'):
+                    url = 'https://voicy.jp' + url
+                broadcast_data['url'] = url
+                
+                # Title might be in the link or in a nearby heading
+                title_elem = elem.select_one('h2, h3, h4, .title, .episode-title')
+                if title_elem:
+                    broadcast_data['title'] = title_elem.get_text(strip=True)
+                else:
+                    broadcast_data['title'] = link.get_text(strip=True)
+            
+            # Check if premium
+            premium_elem = elem.select_one('.premium, .premium-badge, .premium-only')
+            broadcast_data['status'] = 'premium' if premium_elem else 'free'
+            
+            # Extract date and time
+            date_elem = elem.select_one('.date, .broadcast-date, .publish-date')
+            if date_elem:
+                broadcast_data['datetime'] = date_elem.get_text(strip=True)
+            else:
+                # Try to find by regex in the whole element text
+                text = elem.get_text()
+                date_match = re.search(r'\d{4}[/-]\d{1,2}[/-]\d{1,2}(?: \d{1,2}:\d{2})?', text)
+                if date_match:
+                    broadcast_data['datetime'] = date_match.group(0)
+            
+            # Extract duration
+            duration_elem = elem.select_one('.duration, .length, .play-time')
+            if duration_elem:
+                broadcast_data['duration'] = duration_elem.get_text(strip=True)
+            else:
+                # Try to find by regex in the whole element text
+                text = elem.get_text()
+                duration_match = re.search(r'(\d+):(\d+)|(\d+)分(\d+)秒|(\d+)分', text)
+                if duration_match:
+                    broadcast_data['duration'] = duration_match.group(0)
+            
+            # Extract tags
+            tag_elems = elem.select('.tag, .episode-tag, .category-tag')
+            if tag_elems:
+                broadcast_data['tags'] = [tag.get_text(strip=True) for tag in tag_elems]
+            
+            # Only add if we have the minimum required data
+            if 'url' in broadcast_data and 'title' in broadcast_data:
+                broadcasts.append(broadcast_data)
+        
+        # Add a small delay to avoid rate limiting
+        time.sleep(2)
+    
+    logger.info(f"Scraped {len(broadcasts)} broadcasts in total")
+    
+    # Sort broadcasts by date if available (oldest first)
+    # For Japanese dates, we need to normalize the format first
+    if all('datetime' in broadcast for broadcast in broadcasts):
+        # Normalize dates (convert Japanese format to sortable format if needed)
+        for broadcast in broadcasts:
+            date_str = broadcast['datetime']
+            # Handle various date formats
+            if re.match(r'\d{4}[/-]\d{1,2}[/-]\d{1,2}', date_str):
+                # Already in YYYY-MM-DD format
+                pass
+            elif re.match(r'\d{4}年\d{1,2}月\d{1,2}日', date_str):
+                # Convert from Japanese format
+                date_str = date_str.replace('年', '-').replace('月', '-').replace('日', '')
+                broadcast['datetime'] = date_str
+        
+        try:
+            broadcasts.sort(key=lambda x: x['datetime'])
+            logger.info("Broadcasts sorted by datetime (oldest first)")
+        except Exception as e:
+            logger.warning(f"Could not sort broadcasts by date: {e}")
+    
+    # Create XML
+    root = ET.Element("broadcasts")
+    root.set("channel_id", channel_id)
+    root.set("scraped_at", datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    root.set("total_count", str(len(broadcasts)))
+    
+    for broadcast in broadcasts:
+        broadcast_elem = ET.SubElement(root, "broadcast")
+        
+        for key, value in broadcast.items():
+            if key == 'tags' and isinstance(value, list):
+                tags_elem = ET.SubElement(broadcast_elem, "tags")
+                for tag in value:
+                    tag_elem = ET.SubElement(tags_elem, "tag")
+                    tag_elem.text = tag
+            else:
+                elem = ET.SubElement(broadcast_elem, key)
+                elem.text = str(value)
+    
+    # Pretty print XML
+    xml_str = minidom.parseString(ET.tostring(root, encoding='unicode')).toprettyxml(indent="  ")
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    
+    # Save to file
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(xml_str)
+    
+    logger.info(f"Data saved to {output_file}")
+    return len(broadcasts)
+
+if __name__ == "__main__":
+    channel_id = "2834"  # The channel ID from the URL
+    output_file = "voicy_broadcasts.xml"
+    
+    scrape_voicy_channel(channel_id, output_file)
