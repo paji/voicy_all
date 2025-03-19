@@ -1,0 +1,536 @@
+import requests
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+import time
+import os
+import logging
+from datetime import datetime
+import re
+import json
+
+# ロギングの設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# 設定
+CHANNEL_ID = "2834"  # ユーザー自身のチャンネルID
+BASE_URL = f"https://voicy.jp/channel/{CHANNEL_ID}/all"
+OUTPUT_FILE = "voicy_episodes.xml"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+def prettify_xml(elem):
+    """XMLを整形して返す"""
+    rough_string = ET.tostring(elem, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    return reparsed.toprettyxml(indent="  ")
+
+def get_page_content(url):
+    """指定URLのページ内容を取得"""
+    try:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as e:
+        logger.error(f"ページの取得に失敗しました: {url}, エラー: {e}")
+        return None
+
+def extract_json_data(html_content):
+    """HTMLからJSONデータを抽出する"""
+    try:
+        # JSONデータを含む可能性のあるスクリプトタグを探す
+        soup = BeautifulSoup(html_content, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        # 初期データを含むスクリプトを探す
+        for script in scripts:
+            script_text = script.string
+            if script_text and ('window.__INITIAL_DATA__' in script_text or 'window.__PRELOADED_STATE__' in script_text):
+                logger.info("初期データを含むスクリプトを見つけました")
+                
+                # JSONデータを抽出
+                json_str = None
+                if 'window.__INITIAL_DATA__' in script_text:
+                    json_str = script_text.split('window.__INITIAL_DATA__ = ')[1].split(';</script>')[0]
+                elif 'window.__PRELOADED_STATE__' in script_text:
+                    json_str = script_text.split('window.__PRELOADED_STATE__ = ')[1].split(';</script>')[0]
+                
+                if json_str:
+                    return json.loads(json_str)
+        
+        logger.warning("JSONデータを含むスクリプトが見つかりませんでした")
+        return None
+    except Exception as e:
+        logger.error(f"JSONデータの抽出に失敗しました: {e}")
+        return None
+
+def parse_episode_data(url):
+    """エピソードの詳細ページからデータを抽出"""
+    content = get_page_content(url)
+    if not content:
+        return None
+    
+    soup = BeautifulSoup(content, 'html.parser')
+    
+    try:
+        # HTML構造のデバッグ情報
+        logger.info(f"エピソードページの解析開始: {url}")
+        
+        # JSONデータの抽出を試みる
+        json_data = extract_json_data(content)
+        if json_data:
+            logger.info("JSONデータから情報を抽出します")
+            try:
+                # JSONデータの構造に応じて適切なパスを探す
+                episode_data = None
+                
+                # 可能性のあるパスを試す
+                possible_paths = [
+                    'episode', 'voice', 'data.episode', 'data.voice', 
+                    'pageProps.episode', 'pageProps.voice', 'props.pageProps.episode'
+                ]
+                
+                for path in possible_paths:
+                    parts = path.split('.')
+                    current = json_data
+                    valid_path = True
+                    
+                    for part in parts:
+                        if part in current:
+                            current = current[part]
+                        else:
+                            valid_path = False
+                            break
+                    
+                    if valid_path:
+                        episode_data = current
+                        logger.info(f"JSONデータのパス '{path}' から情報を見つけました")
+                        break
+                
+                if episode_data:
+                    # JSONから情報を抽出
+                    title = episode_data.get('title', '')
+                    if not title and 'name' in episode_data:
+                        title = episode_data['name']
+                    
+                    status = "プレミアム限定" if episode_data.get('isPremium', False) else "無料配信"
+                    
+                    date_str = "不明"
+                    if 'publishedAt' in episode_data:
+                        date_str = episode_data['publishedAt']
+                    elif 'createdAt' in episode_data:
+                        date_str = episode_data['createdAt']
+                    
+                    duration = "不明"
+                    if 'duration' in episode_data:
+                        duration = str(episode_data['duration']) + "秒"
+                    elif 'length' in episode_data:
+                        duration = str(episode_data['length']) + "秒"
+                    
+                    tags = []
+                    if 'tags' in episode_data and isinstance(episode_data['tags'], list):
+                        tags = [tag.get('name', '') for tag in episode_data['tags'] if 'name' in tag]
+                    
+                    return {
+                        "url": url,
+                        "title": title,
+                        "status": status,
+                        "date": date_str,
+                        "duration": duration,
+                        "tags": tags
+                    }
+            except Exception as json_e:
+                logger.error(f"JSONデータからの情報抽出に失敗しました: {json_e}")
+                # JSONからの抽出に失敗した場合はHTMLパースにフォールバック
+        
+        # タイトル (複数のセレクタを試す)
+        title = None
+        title_selectors = ['h1.voice-title', 'h1.episode-title', '.episode-detail h1', '.voice-detail h1']
+        for selector in title_selectors:
+            title_elem = soup.select_one(selector)
+            if title_elem:
+                title = title_elem.text.strip()
+                logger.info(f"タイトルを検出: {title} (セレクタ: {selector})")
+                break
+        
+        if not title:
+            # セレクタが失敗した場合のフォールバック
+            h1_tags = soup.find_all('h1')
+            if h1_tags:
+                title = h1_tags[0].text.strip()
+                logger.info(f"フォールバックでタイトルを検出: {title}")
+            else:
+                title = "タイトル不明"
+                logger.warning("タイトルを検出できませんでした")
+        
+        # プレミアム限定か無料配信か
+        status = "無料配信"  # デフォルト値
+        premium_selectors = ['span.premium-icon', '.premium-badge', '.premium-label']
+        for selector in premium_selectors:
+            if soup.select_one(selector):
+                status = "プレミアム限定"
+                logger.info(f"プレミアムステータスを検出 (セレクタ: {selector})")
+                break
+        
+        # 配信日時 (複数のセレクタを試す)
+        date_str = "不明"
+        date_selectors = ['div.voice-detail div.date', '.episode-date', '.publish-date', '.voice-publish-date']
+        for selector in date_selectors:
+            date_elem = soup.select_one(selector)
+            if date_elem:
+                date_str = date_elem.text.strip()
+                logger.info(f"配信日時を検出: {date_str} (セレクタ: {selector})")
+                break
+        
+        # 日付情報が見つからない場合のフォールバック
+        if date_str == "不明":
+            # 日付パターンを持つ要素を探す
+            date_pattern = re.compile(r'\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2}')
+            for elem in soup.find_all(text=date_pattern):
+                date_str = elem.strip()
+                logger.info(f"正規表現でマッチした日付: {date_str}")
+                break
+        
+        # 配信分数 (複数のセレクタを試す)
+        duration = "不明"
+        duration_selectors = ['div.voice-detail div.duration', '.episode-duration', '.play-time', '.voice-duration']
+        for selector in duration_selectors:
+            duration_elem = soup.select_one(selector)
+            if duration_elem:
+                duration = duration_elem.text.strip()
+                logger.info(f"配信分数を検出: {duration} (セレクタ: {selector})")
+                break
+        
+        # 持続時間が見つからない場合のフォールバック
+        if duration == "不明":
+            # 時間パターン (例: "5:23" or "12分33秒") を持つ要素を探す
+            time_pattern = re.compile(r'(\d+[:分]\d+|(\d+)秒)')
+            for elem in soup.find_all(text=time_pattern):
+                duration = elem.strip()
+                logger.info(f"正規表現でマッチした時間: {duration}")
+                break
+        
+        # タグ (複数のセレクタを試す)
+        tags = []
+        tag_selectors = ['div.tag span', '.episode-tags .tag', '.voice-tags .tag']
+        for selector in tag_selectors:
+            tags_elems = soup.select(selector)
+            if tags_elems:
+                tags = [tag.text.strip() for tag in tags_elems]
+                logger.info(f"{len(tags)}個のタグを検出 (セレクタ: {selector})")
+                break
+        
+        return {
+            "url": url,
+            "title": title,
+            "status": status,
+            "date": date_str,
+            "duration": duration,
+            "tags": tags
+        }
+    except Exception as e:
+        logger.error(f"エピソードデータの解析に失敗しました: {url}, エラー: {e}")
+        return None
+
+def get_all_episodes():
+    """チャンネルの全エピソードのURLを取得"""
+    page_num = 1
+    all_episode_urls = []
+    
+    while True:
+        logger.info(f"ページ {page_num} を取得中...")
+        if page_num == 1:
+            url = BASE_URL
+        else:
+            url = f"{BASE_URL}?page={page_num}"
+        
+        content = get_page_content(url)
+        if not content:
+            break
+        
+        # ページのHTMLをデバッグ情報として保存
+        logger.info(f"ページ {page_num} の内容を解析中")
+        
+        # JSONデータの抽出を試みる
+        json_data = extract_json_data(content)
+        if json_data:
+            logger.info("JSONデータからエピソードリストを抽出します")
+            try:
+                # JSONデータの構造に応じて適切なパスを探す
+                episodes_list = None
+                
+                # 可能性のあるパスを試す
+                possible_paths = [
+                    'episodes', 'voices', 'data.episodes', 'data.voices', 
+                    'pageProps.episodes', 'pageProps.voices', 'props.pageProps.episodes',
+                    'channel.episodes', 'data.channel.episodes'
+                ]
+                
+                for path in possible_paths:
+                    parts = path.split('.')
+                    current = json_data
+                    valid_path = True
+                    
+                    for part in parts:
+                        if part in current:
+                            current = current[part]
+                        else:
+                            valid_path = False
+                            break
+                    
+                    if valid_path and isinstance(current, list):
+                        episodes_list = current
+                        logger.info(f"JSONデータのパス '{path}' からエピソードリストを見つけました")
+                        break
+                
+                if episodes_list:
+                    for episode in episodes_list:
+                        if 'id' in episode:
+                            episode_id = episode['id']
+                            episode_url = f"https://voicy.jp/channel/{CHANNEL_ID}/{episode_id}"
+                            if episode_url not in all_episode_urls:
+                                all_episode_urls.append(episode_url)
+                                logger.info(f"JSONからエピソードURLを追加: {episode_url}")
+                    
+                    # 次のページ情報を探す
+                    has_next_page = False
+                    
+                    # ページネーション情報を探す
+                    pagination_paths = [
+                        'pagination', 'data.pagination', 'pageProps.pagination'
+                    ]
+                    
+                    for path in pagination_paths:
+                        parts = path.split('.')
+                        current = json_data
+                        valid_path = True
+                        
+                        for part in parts:
+                            if part in current:
+                                current = current[part]
+                            else:
+                                valid_path = False
+                                break
+                        
+                        if valid_path and isinstance(current, dict):
+                            if 'hasNextPage' in current and current['hasNextPage']:
+                                has_next_page = True
+                                logger.info(f"JSONデータから次のページ情報を検出")
+                                break
+                    
+                    if not has_next_page:
+                        logger.info("JSONデータから次のページが見つかりませんでした")
+                        if len(episodes_list) > 0:
+                            # エピソードが見つかっているので、次のページを試してみる
+                            logger.info(f"エピソードが見つかったので次のページを試します")
+                            page_num += 1
+                            time.sleep(2)
+                            continue
+                        else:
+                            break
+                    
+                    page_num += 1
+                    time.sleep(2)
+                    continue
+            except Exception as json_e:
+                logger.error(f"JSONデータからのエピソードリスト抽出に失敗しました: {json_e}")
+                # JSONからの抽出に失敗した場合はHTMLパースにフォールバック
+        
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # 複数の可能性のあるセレクタを試す
+        episode_links = []
+        selectors = [
+            'a.voice-list-item',  # 旧セレクタ
+            'a.episode-card',     # 可能性のある新セレクタ
+            '.episode-item a',    # 別の可能性
+            '.voice-card a',      # 別の可能性
+            'a[href*="/channel/"][href*="/"]'  # チャンネルページへのリンクを含むa要素
+        ]
+        
+        for selector in selectors:
+            links = soup.select(selector)
+            if links:
+                logger.info(f"{len(links)}個のエピソードリンクを検出 (セレクタ: {selector})")
+                episode_links = links
+                break
+        
+        # どのセレクタもマッチしない場合のフォールバック
+        if not episode_links:
+            # チャンネルIDとエピソードIDのパターンを含むリンクを探す
+            pattern = f"/channel/{CHANNEL_ID}/[0-9]+"
+            all_links = soup.find_all('a', href=re.compile(pattern))
+            if all_links:
+                logger.info(f"{len(all_links)}個のエピソードリンクを正規表現で検出")
+                episode_links = all_links
+        
+        if not episode_links:
+            logger.warning(f"ページ {page_num} でエピソードリンクが見つかりませんでした")
+            # APIエンドポイントを直接試す
+            try:
+                api_url = f"https://voicy.jp/api/channel/{CHANNEL_ID}/voices?page={page_num}"
+                logger.info(f"APIエンドポイントを試します: {api_url}")
+                
+                response = requests.get(api_url, headers=HEADERS)
+                if response.status_code == 200:
+                    api_data = response.json()
+                    if 'voices' in api_data and isinstance(api_data['voices'], list):
+                        for voice in api_data['voices']:
+                            if 'id' in voice:
+                                episode_url = f"https://voicy.jp/channel/{CHANNEL_ID}/{voice['id']}"
+                                if episode_url not in all_episode_urls:
+                                    all_episode_urls.append(episode_url)
+                                    logger.info(f"APIからエピソードURLを追加: {episode_url}")
+                        
+                        if 'hasNextPage' in api_data and api_data['hasNextPage']:
+                            page_num += 1
+                            time.sleep(2)
+                            continue
+                        else:
+                            break
+                    else:
+                        break
+                else:
+                    break
+            except Exception as api_e:
+                logger.error(f"APIリクエストに失敗しました: {api_e}")
+                break
+        
+        for link in episode_links:
+            href = link.get('href')
+            if href:
+                # 相対URLを絶対URLに変換
+                if href.startswith('/'):
+                    episode_url = "https://voicy.jp" + href
+                else:
+                    episode_url = href
+                
+                # 既に追加されていないか確認
+                if episode_url not in all_episode_urls:
+                    all_episode_urls.append(episode_url)
+        
+        logger.info(f"現在の合計エピソード数: {len(all_episode_urls)}")
+        
+        # 次のページがあるか確認 (複数のセレクタを試す)
+        has_next_page = False
+        next_selectors = ['li.next a', '.pagination .next', '.pager .next', 'a[rel="next"]']
+        for selector in next_selectors:
+            next_button = soup.select_one(selector)
+            if next_button:
+                has_next_page = True
+                logger.info(f"次のページを検出 (セレクタ: {selector})")
+                break
+        
+        if not has_next_page:
+            # ページ番号を含むリンクを探す
+            next_page_num = page_num + 1
+            next_page_links = soup.find_all('a', href=re.compile(f"page={next_page_num}"))
+            if next_page_links:
+                has_next_page = True
+                logger.info(f"次のページを正規表現で検出: {next_page_num}")
+        
+        if not has_next_page:
+            logger.info(f"これ以上のページはありません")
+            break
+        
+        page_num += 1
+        time.sleep(2)  # サーバーに負荷をかけないよう待機
+    
+    return all_episode_urls
+
+def create_xml(episodes):
+    """エピソードデータからXMLを作成"""
+    root = ET.Element("voicy_episodes")
+    root.set("channel_id", CHANNEL_ID)
+    root.set("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
+    for episode in episodes:
+        if not episode:
+            continue
+        
+        episode_elem = ET.SubElement(root, "episode")
+        
+        url_elem = ET.SubElement(episode_elem, "url")
+        url_elem.text = episode["url"]
+        
+        title_elem = ET.SubElement(episode_elem, "title")
+        title_elem.text = episode["title"]
+        
+        status_elem = ET.SubElement(episode_elem, "status")
+        status_elem.text = episode["status"]
+        
+        date_elem = ET.SubElement(episode_elem, "date")
+        date_elem.text = episode["date"]
+        
+        duration_elem = ET.SubElement(episode_elem, "duration")
+        duration_elem.text = episode["duration"]
+        
+        tags_elem = ET.SubElement(episode_elem, "tags")
+        for tag in episode["tags"]:
+            tag_elem = ET.SubElement(tags_elem, "tag")
+            tag_elem.text = tag
+    
+    return root
+
+def main():
+    """メイン処理"""
+    try:
+        logger.info("Voicyエピソードの取得を開始します")
+        
+        # 全エピソードのURLを取得
+        episode_urls = get_all_episodes()
+        logger.info(f"合計 {len(episode_urls)} のエピソードを見つけました")
+        
+        if not episode_urls:
+            logger.error("エピソードが見つかりませんでした。サイト構造が変更された可能性があります。")
+            # エラー情報をXMLに保存
+            root = ET.Element("voicy_episodes")
+            root.set("channel_id", CHANNEL_ID)
+            root.set("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            root.set("error", "エピソードが見つかりませんでした。サイト構造が変更された可能性があります。")
+            
+            xml_str = prettify_xml(root)
+            with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                f.write(xml_str)
+            
+            return
+        
+        # 古い順にソート (URLの数字部分でソート)
+        try:
+            episode_urls.sort(key=lambda url: int(url.split('/')[-1]))
+        except Exception as e:
+            logger.error(f"URLのソートに失敗しました: {e}")
+            # ソートできない場合はそのまま使用
+        
+        # 各エピソードの詳細を取得
+        episodes_data = []
+        for i, url in enumerate(episode_urls):
+            logger.info(f"エピソード {i+1}/{len(episode_urls)} を処理中: {url}")
+            episode_data = parse_episode_data(url)
+            if episode_data:
+                episodes_data.append(episode_data)
+            time.sleep(2)  # サーバーに負荷をかけないよう待機
+        
+        # XMLを作成
+        xml_root = create_xml(episodes_data)
+        xml_str = prettify_xml(xml_root)
+        
+        # XMLをファイルに保存
+        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            f.write(xml_str)
+        
+        logger.info(f"XMLファイルを保存しました: {OUTPUT_FILE}")
+    
+    except Exception as e:
+        logger.error(f"予期せぬエラーが発生しました: {e}")
+        # エラー情報をファイルに保存
+        with open("error_log.txt", "w", encoding='utf-8') as f:
+            f.write(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
