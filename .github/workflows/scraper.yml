@@ -1,0 +1,384 @@
+name: Voicy URL Scraper
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # 毎週日曜日に実行
+  workflow_dispatch:  # 手動実行用
+
+# 明示的に権限を設定
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  voicy-url-scraper:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v4
+      
+      - name: Python 3.10 セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      
+      - name: Chrome ブラウザのセットアップ
+        uses: browser-actions/setup-chrome@latest
+      
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 selenium webdriver-manager tqdm
+      
+      - name: Voicy URL スクレイピングスクリプト作成
+        run: |
+          cat > voicy_url_scraper.py << 'EOF'
+          import os
+          import re
+          import json
+          import time
+          import random
+          from datetime import datetime
+          from bs4 import BeautifulSoup
+          import traceback
+          from tqdm import tqdm
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+          from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+          from webdriver_manager.chrome import ChromeDriverManager
+
+          # Voicyチャンネル情報
+          CHANNEL_ID = "2834"  # 裏・パジちゃんねる
+          CHANNEL_URL = f"https://voicy.jp/channel/{CHANNEL_ID}/all"  # チャンネル全エピソードページ
+
+          # 出力ファイル設定
+          OUTPUT_DIR = "output"
+          OUTPUT_JSON = os.path.join(OUTPUT_DIR, "voicy_episodes.json")
+          OUTPUT_URLS_ONLY = os.path.join(OUTPUT_DIR, "voicy_urls_only.json")
+          DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
+
+          # スクレイピング設定
+          MAX_RETRIES = 5  # 最大リトライ回数
+          SCROLL_PAUSE_TIME = 1  # スクロール間の待機時間（秒）
+          MAX_SCROLL_ATTEMPTS = 500  # 最大スクロール試行回数（約2200件のエピソードを取得するため）
+          TARGET_EPISODES = 2200  # 目標エピソード数
+
+          def setup_directories():
+              """必要なディレクトリを作成"""
+              for directory in [OUTPUT_DIR, DEBUG_DIR]:
+                  os.makedirs(directory, exist_ok=True)
+                  print(f"ディレクトリを確認/作成しました: {directory}")
+
+          def random_sleep(min_seconds=0.5, max_seconds=1.5):
+              """ランダムな時間スリープする（サーバー負荷軽減のため）"""
+              sleep_time = random.uniform(min_seconds, max_seconds)
+              time.sleep(sleep_time)
+              return sleep_time
+
+          def get_episodes_info_selenium():
+              """
+              Seleniumを使用してVoicyチャンネルのエピソード情報を取得する関数
+              
+              Returns:
+                  list: エピソード情報のリスト
+              """
+              print(f"Voicyチャンネル {CHANNEL_URL} からエピソード情報を取得します...")
+              
+              episodes = []
+              episode_ids_seen = set()
+              retry_count = 0
+              
+              try:
+                  # Chromeオプションの設定
+                  chrome_options = Options()
+                  chrome_options.add_argument("--headless")
+                  chrome_options.add_argument("--no-sandbox")
+                  chrome_options.add_argument("--disable-dev-shm-usage")
+                  chrome_options.add_argument("--disable-gpu")
+                  chrome_options.add_argument("--window-size=1920,1080")
+                  chrome_options.add_argument("--disable-notifications")
+                  chrome_options.add_argument("--disable-extensions")
+                  chrome_options.add_argument("--disable-infobars")
+                  
+                  # WebDriverの初期化
+                  service = Service(ChromeDriverManager().install())
+                  driver = webdriver.Chrome(service=service, options=chrome_options)
+                  
+                  # タイムアウト設定
+                  driver.set_page_load_timeout(60)
+                  
+                  # 最初のページを読み込み
+                  driver.get(CHANNEL_URL)
+                  
+                  # ページが完全に読み込まれるまで待機
+                  WebDriverWait(driver, 30).until(
+                      EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/channel/'][href*='/']"))
+                  )
+                  
+                  # デバッグ用にHTMLを保存
+                  with open(os.path.join(DEBUG_DIR, "initial_page.html"), "w", encoding="utf-8") as f:
+                      f.write(driver.page_source)
+                  
+                  # プログレスバーの初期化（目標エピソード数: 2200）
+                  progress = tqdm(total=TARGET_EPISODES, desc="エピソード取得")
+                  
+                  # オートページローディングのためのスクロール処理
+                  scroll_count = 0
+                  no_new_episodes_count = 0
+                  max_no_new_episodes = 5  # 新しいエピソードが見つからない最大回数
+                  
+                  while scroll_count < MAX_SCROLL_ATTEMPTS and len(episodes) < TARGET_EPISODES:
+                      # 現在のエピソード数を記録
+                      current_episode_count = len(episodes)
+                      
+                      # ページの最下部までスクロール
+                      driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                      random_sleep(SCROLL_PAUSE_TIME, SCROLL_PAUSE_TIME + 1)
+                      
+                      # 新しいコンテンツが読み込まれるのを待機
+                      try:
+                          WebDriverWait(driver, 5).until(
+                              lambda d: d.execute_script("return document.body.scrollHeight") > driver.execute_script("return window.innerHeight + window.pageYOffset")
+                          )
+                      except:
+                          pass
+                      
+                      # エピソードリンクを取得
+                      episode_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/channel/'][href*='/']")
+                      
+                      # エピソード情報を抽出
+                      for link in episode_links:
+                          try:
+                              href = link.get_attribute("href")
+                              # エピソードURLのパターンをチェック
+                              match = re.search(r'/channel/\d+/(\d+)$', href)
+                              if match:
+                                  episode_id = match.group(1)
+                                  if episode_id not in episode_ids_seen:
+                                      episode_ids_seen.add(episode_id)
+                                      
+                                      # 親要素を取得してタイトルと日付を探す
+                                      parent = link
+                                      title_element = None
+                                      
+                                      for _ in range(5):  # 最大5階層まで親を辿る
+                                          try:
+                                              parent = parent.find_element(By.XPATH, "..")
+                                              try:
+                                                  title_element = parent.find_element(By.CSS_SELECTOR, "h2, h3, .title, .episode-title")
+                                                  if title_element:
+                                                      break
+                                              except:
+                                                  pass
+                                          except:
+                                              break
+                                      
+                                      # タイトルを取得（見つからない場合はデフォルト値を使用）
+                                      title = title_element.text if title_element else f"エピソード {episode_id}"
+                                      
+                                      # 日付要素を探す
+                                      date_str = None
+                                      try:
+                                          if parent:
+                                              date_element = parent.find_element(By.CSS_SELECTOR, "time, .date, .episode-date")
+                                              date_str = date_element.text.strip()
+                                      except:
+                                          date_str = None
+                                      
+                                      # 日付を解析（様々なフォーマットに対応）
+                                      episode_date = None
+                                      if date_str:
+                                          try:
+                                              # 日付フォーマットのパターンを試行
+                                              date_formats = [
+                                                  "%Y年%m月%d日",
+                                                  "%Y/%m/%d",
+                                                  "%m月%d日",
+                                                  "%m/%d"
+                                              ]
+                                              
+                                              for date_format in date_formats:
+                                                  try:
+                                                      if "年" not in date_str and "/" not in date_str:
+                                                          # 「3日前」などの相対日付の場合
+                                                          episode_date = datetime.now()
+                                                          break
+                                                      
+                                                      if "年" not in date_str and ("月" in date_str or "/" in date_str):
+                                                          # 年が省略されている場合は現在の年を使用
+                                                          current_year = datetime.now().year
+                                                          parsed_date = datetime.strptime(date_str, date_format)
+                                                          episode_date = parsed_date.replace(year=current_year)
+                                                          break
+                                                      
+                                                      # 完全な日付
+                                                      episode_date = datetime.strptime(date_str, date_format)
+                                                      break
+                                                  except ValueError:
+                                                      continue
+                                          except Exception as e:
+                                              print(f"日付の解析中にエラーが発生しました: {e}")
+                                      
+                                      # 日付が解析できなかった場合は現在の日付を使用
+                                      if episode_date is None:
+                                          print(f"日付を解析できませんでした: {date_str}")
+                                          episode_date = datetime.now()
+                                      
+                                      date_str = episode_date.strftime("%Y-%m-%d")
+                                      
+                                      # エピソード情報を追加
+                                      episodes.append({
+                                          "id": episode_id,
+                                          "title": title,
+                                          "date": date_str,
+                                          "url": href
+                                      })
+                                      
+                                      # プログレスバーを更新
+                                      progress.update(1)
+                                      progress.set_description(f"エピソード取得中 ({len(episodes)}/{TARGET_EPISODES})")
+                                      
+                                      # 定期的に中間結果を保存（100件ごと）
+                                      if len(episodes) % 100 == 0:
+                                          save_episodes_to_json(episodes, is_temp=True)
+                                          print(f"現在 {len(episodes)} 件のエピソードを取得しました。")
+                          except StaleElementReferenceException:
+                              print("要素が古くなりました。スキップします。")
+                              continue
+                          except Exception as e:
+                              print(f"エピソード情報の抽出中にエラーが発生しました: {e}")
+                              continue
+                      
+                      # スクロールカウントを増やす
+                      scroll_count += 1
+                      
+                      # 新しいエピソードが追加されたかチェック
+                      if len(episodes) > current_episode_count:
+                          no_new_episodes_count = 0  # リセット
+                      else:
+                          no_new_episodes_count += 1
+                          print(f"新しいエピソードが見つかりませんでした。({no_new_episodes_count}/{max_no_new_episodes})")
+                          
+                          if no_new_episodes_count >= max_no_new_episodes:
+                              print(f"連続 {max_no_new_episodes} 回新しいエピソードが見つかりませんでした。スクレイピングを終了します。")
+                              break
+                      
+                      # 100スクロールごとにステータス表示
+                      if scroll_count % 100 == 0:
+                          print(f"スクロール回数: {scroll_count}, 取得エピソード数: {len(episodes)}")
+                          
+                          # ページの高さを取得して表示（デバッグ用）
+                          page_height = driver.execute_script("return document.body.scrollHeight")
+                          window_height = driver.execute_script("return window.innerHeight")
+                          scroll_position = driver.execute_script("return window.pageYOffset")
+                          print(f"ページ高さ: {page_height}, ウィンドウ高さ: {window_height}, スクロール位置: {scroll_position}")
+                          
+                          # 現在のHTMLを保存（デバッグ用）
+                          with open(os.path.join(DEBUG_DIR, f"scroll_{scroll_count}.html"), "w", encoding="utf-8") as f:
+                              f.write(driver.page_source)
+                  
+                  # プログレスバーを閉じる
+                  progress.close()
+                  
+                  print(f"合計 {len(episodes)} 件のエピソードを取得しました。")
+                  print(f"スクロール回数: {scroll_count}")
+                  
+              except Exception as e:
+                  print(f"エピソード情報の取得中にエラーが発生しました: {e}")
+                  traceback.print_exc()
+              finally:
+                  if 'driver' in locals() and driver:
+                      driver.quit()
+              
+              return episodes
+
+          def save_episodes_to_json(episodes, is_temp=False):
+              """
+              エピソード情報をJSONファイルに保存する関数
+              
+              Args:
+                  episodes: エピソード情報のリスト
+                  is_temp: 一時ファイルとして保存するかどうか
+              """
+              try:
+                  output_path = OUTPUT_JSON
+                  if is_temp:
+                      output_path = os.path.join(OUTPUT_DIR, f"voicy_episodes_temp_{len(episodes)}.json")
+                  
+                  with open(output_path, 'w', encoding='utf-8') as f:
+                      json.dump(episodes, f, ensure_ascii=False, indent=2)
+                  
+                  if is_temp:
+                      print(f"一時エピソード情報をJSONファイルに保存しました: {output_path}")
+                  else:
+                      print(f"エピソード情報をJSONファイルに保存しました: {output_path}")
+              except Exception as e:
+                  print(f"JSONファイルの保存中にエラーが発生しました: {e}")
+
+          def save_urls_only_to_json(episodes):
+              """
+              URLのみのリストをJSONファイルに保存する関数
+              
+              Args:
+                  episodes: エピソード情報のリスト
+              """
+              try:
+                  urls_only = [episode["url"] for episode in episodes]
+                  with open(OUTPUT_URLS_ONLY, 'w', encoding='utf-8') as f:
+                      json.dump(urls_only, f, ensure_ascii=False, indent=2)
+                  print(f"URLのみのリストをJSONファイルに保存しました: {OUTPUT_URLS_ONLY}")
+              except Exception as e:
+                  print(f"URLのみのリストの保存中にエラーが発生しました: {e}")
+
+          def main():
+              """メイン関数"""
+              print("Voicy URL スクレイパーを開始します...")
+              start_time = time.time()
+              
+              # ディレクトリ設定
+              setup_directories()
+              
+              # エピソード情報を取得
+              episodes = get_episodes_info_selenium()
+              
+              # エピソード情報をJSONファイルに保存
+              save_episodes_to_json(episodes)
+              
+              # URLのみのリストも作成
+              save_urls_only_to_json(episodes)
+              
+              end_time = time.time()
+              elapsed_time = end_time - start_time
+              hours, remainder = divmod(elapsed_time, 3600)
+              minutes, seconds = divmod(remainder, 60)
+              
+              print(f"処理が完了しました。実行時間: {int(hours)}時間 {int(minutes)}分 {int(seconds)}秒")
+              print(f"取得したエピソード数: {len(episodes)}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+      
+      - name: スクリプトを実行
+        run: python voicy_url_scraper.py
+      
+      - name: 結果をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicy-episodes-json
+          path: |
+            output/voicy_episodes.json
+            output/voicy_urls_only.json
+      
+      - name: 結果をコミット
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add output/voicy_episodes.json output/voicy_urls_only.json
+          git commit -m "Update Voicy episodes JSON" || echo "No changes to commit"
+          git push
