@@ -1,0 +1,838 @@
+name: Voicy MP3 Downloader
+
+on:
+  schedule:
+    - cron: '31 * * * *'  # 毎時31分に実行
+  workflow_dispatch:  # 手動実行用
+
+# 明示的に権限を設定
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  voicy-mp3-download:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v3
+      
+      - name: Python 3.10 セットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Chrome ブラウザのセットアップ
+        uses: browser-actions/setup-chrome@v1
+      
+      - name: FFmpegのインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+      
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 selenium webdriver-manager
+      
+      - name: Voicy MP3ダウンロードスクリプト作成
+        run: |
+          cat > downloader.py << 'EOF'
+          import os
+          import re
+          import json
+          import requests
+          import subprocess
+          from datetime import datetime
+          from bs4 import BeautifulSoup
+          import traceback
+          import time
+          import shutil
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+          from webdriver_manager.chrome import ChromeDriverManager
+
+          # 設定
+          MP3_DIR = "mp3_downloads"  # MP3保存ディレクトリ
+          TEMP_DIR = "temp_segments"  # 一時ファイル用ディレクトリ
+          DEBUG_DIR = "debug_files"  # デバッグファイル用ディレクトリ
+          OUTPUT_DIR = "output"  # 出力ディレクトリ
+          JSON_FILE = os.path.join(OUTPUT_DIR, "voicy_urls_only.json")  # URLリストのJSONファイル
+          DOWNLOAD_HISTORY_FILE = "download_history.json"  # ダウンロード履歴ファイル
+          MAX_DOWNLOADS_PER_RUN = 10  # 1回の実行でダウンロードする最大件数
+          DEBUG_MODE = True  # デバッグモード
+
+          def setup_directories():
+              """必要なディレクトリを作成"""
+              for directory in [MP3_DIR, TEMP_DIR, DEBUG_DIR, OUTPUT_DIR]:
+                  os.makedirs(directory, exist_ok=True)
+                  print(f"ディレクトリを確認/作成しました: {directory}")
+
+          def create_sample_json():
+              """サンプルのJSONファイルを作成（テスト用）"""
+              if not os.path.exists(JSON_FILE):
+                  print(f"サンプルのJSONファイルを作成します: {JSON_FILE}")
+                  sample_urls = [
+                      "https://voicy.jp/channel/1234/567890",
+                      "https://voicy.jp/channel/1234/567891"
+                  ]
+                  try:
+                      with open(JSON_FILE, "w") as f:
+                          json.dump(sample_urls, f, indent=2)
+                      print(f"サンプルのJSONファイルを作成しました")
+                  except Exception as e:
+                      print(f"サンプルのJSONファイル作成エラー: {e}")
+
+          def load_download_history():
+              """ダウンロード履歴を読み込む"""
+              if os.path.exists(DOWNLOAD_HISTORY_FILE):
+                  try:
+                      with open(DOWNLOAD_HISTORY_FILE, "r") as f:
+                          return json.load(f)
+                  except Exception as e:
+                      print(f"履歴ファイルの読み込みエラー: {e}")
+                      return []
+              return []
+
+          def save_download_history(history):
+              """ダウンロード履歴を保存する"""
+              try:
+                  with open(DOWNLOAD_HISTORY_FILE, "w") as f:
+                      json.dump(history, f, indent=2)
+              except Exception as e:
+                  print(f"履歴ファイルの保存エラー: {e}")
+
+          def load_urls_from_json():
+              """JSONファイルからURLリストを読み込む"""
+              try:
+                  if not os.path.exists(JSON_FILE):
+                      print(f"JSONファイルが存在しません: {JSON_FILE}")
+                      create_sample_json()
+                      
+                  with open(JSON_FILE, "r") as f:
+                      urls = json.load(f)
+                      print(f"JSONファイルから{len(urls)}件のURLを読み込みました: {JSON_FILE}")
+                      return urls
+              except Exception as e:
+                  print(f"JSONファイルの読み込みエラー: {e}")
+                  traceback.print_exc()
+                  return []
+
+          def ensure_ffmpeg_installed():
+              """FFmpegがインストールされていることを確認し、なければインストールを試みる"""
+              try:
+                  # FFmpegがインストールされているか確認
+                  result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+                  if result.stdout.strip():
+                      print("FFmpegはすでにインストールされています")
+                      return True
+                  
+                  print("FFmpegがインストールされていません。インストールを試みます...")
+                  
+                  # FFmpegをインストール
+                  install_cmd = ["sudo", "apt-get", "update", "-y"]
+                  subprocess.run(install_cmd, check=True)
+                  
+                  install_cmd = ["sudo", "apt-get", "install", "-y", "ffmpeg"]
+                  subprocess.run(install_cmd, check=True)
+                  
+                  # インストール確認
+                  result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+                  if result.stdout.strip():
+                      print("FFmpegのインストールに成功しました")
+                      return True
+                  else:
+                      print("FFmpegのインストールに失敗しました")
+                      return False
+              except Exception as e:
+                  print(f"FFmpegインストールエラー: {e}")
+                  traceback.print_exc()
+                  return False
+
+          def save_debug_info(driver, episode_id, suffix=""):
+              """デバッグ情報を保存"""
+              if not DEBUG_MODE:
+                  return
+              
+              try:
+                  # ページソースを保存
+                  page_source = driver.page_source
+                  debug_file = os.path.join(DEBUG_DIR, f"page_source_{episode_id}{suffix}.html")
+                  with open(debug_file, "w", encoding="utf-8") as f:
+                      f.write(page_source)
+                  print(f"ページソースを保存しました: {debug_file}")
+                  
+                  # スクリーンショットを保存
+                  screenshot_file = os.path.join(DEBUG_DIR, f"screenshot_{episode_id}{suffix}.png")
+                  driver.save_screenshot(screenshot_file)
+                  print(f"スクリーンショットを保存しました: {screenshot_file}")
+                  
+                  # コンソールログを保存
+                  logs = driver.get_log('browser')
+                  log_file = os.path.join(DEBUG_DIR, f"console_log_{episode_id}{suffix}.txt")
+                  with open(log_file, "w", encoding="utf-8") as f:
+                      for log in logs:
+                          f.write(f"{log['level']}: {log['message']}\n")
+                  print(f"コンソールログを保存しました: {log_file}")
+              except Exception as e:
+                  print(f"デバッグ情報保存エラー: {e}")
+
+          def extract_audio_urls_from_javascript(page_source):
+              """JavaScriptからオーディオURLを抽出"""
+              audio_urls = []
+              
+              # パターン1: 一般的なMP3 URL
+              mp3_matches = re.findall(r'(https?://[^\s"\']+\.mp3)', page_source)
+              if mp3_matches:
+                  audio_urls.extend(mp3_matches)
+                  print(f"JavaScriptから{len(mp3_matches)}個のMP3 URLを抽出しました")
+              
+              # パターン2: m3u8 URL
+              m3u8_matches = re.findall(r'(https?://[^\s"\']+\.m3u8)', page_source)
+              if m3u8_matches:
+                  audio_urls.extend(m3u8_matches)
+                  print(f"JavaScriptから{len(m3u8_matches)}個のm3u8 URLを抽出しました")
+              
+              # パターン3: JSON内のURLパターン
+              json_url_matches = re.findall(r'"url"\s*:\s*"(https?://[^"]+)"', page_source)
+              if json_url_matches:
+                  for url in json_url_matches:
+                      if '.mp3' in url or '.m3u8' in url:
+                          audio_urls.append(url)
+                  print(f"JSON内から{len(json_url_matches)}個のURLを抽出しました")
+              
+              # パターン4: data-src属性
+              data_src_matches = re.findall(r'data-src="(https?://[^"]+)"', page_source)
+              if data_src_matches:
+                  for url in data_src_matches:
+                      if '.mp3' in url or '.m3u8' in url:
+                          audio_urls.append(url)
+                  print(f"data-src属性から{len(data_src_matches)}個のURLを抽出しました")
+              
+              # 重複を削除
+              audio_urls = list(set(audio_urls))
+              
+              return audio_urls
+
+          def get_episode_info(url):
+              """Voicyエピソードページから情報を取得"""
+              print(f"::group::エピソード情報取得: {url}")
+              driver = None
+              
+              try:
+                  # Chromeのオプション設定
+                  chrome_options = Options()
+                  chrome_options.add_argument("--headless")
+                  chrome_options.add_argument("--no-sandbox")
+                  chrome_options.add_argument("--disable-dev-shm-usage")
+                  chrome_options.add_argument("--disable-gpu")
+                  chrome_options.add_argument("--window-size=1920,1080")
+                  chrome_options.add_argument("--log-level=3")
+                  
+                  # Chromeドライバーの設定
+                  service = Service(ChromeDriverManager().install())
+                  driver = webdriver.Chrome(service=service, options=chrome_options)
+                  
+                  # ページにアクセス
+                  print(f"ページにアクセス中: {url}")
+                  driver.get(url)
+                  
+                  # ページの読み込みを待機
+                  WebDriverWait(driver, 10).until(
+                      EC.presence_of_element_located((By.TAG_NAME, "body"))
+                  )
+                  
+                  # JavaScriptの実行を待機
+                  time.sleep(3)
+                  
+                  # デバッグ情報を保存
+                  episode_id = url.split("/")[-1]
+                  save_debug_info(driver, episode_id)
+                  
+                  # ページソースを取得
+                  page_source = driver.page_source
+                  
+                  # BeautifulSoupでパース
+                  soup = BeautifulSoup(page_source, "html.parser")
+                  
+                  # エピソードタイトルを取得
+                  title_element = soup.select_one("h1.title, h1.episode-title, .episode-title h1")
+                  title = title_element.text.strip() if title_element else "不明なタイトル"
+                  
+                  # 放送日を取得
+                  date_element = soup.select_one(".date, .episode-date, .published-date")
+                  date_text = date_element.text.strip() if date_element else ""
+                  
+                  # 日付形式を変換（例: "2023年1月1日" → "20230101"）
+                  date = ""
+                  if date_text:
+                      date_match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', date_text)
+                      if date_match:
+                          year, month, day = date_match.groups()
+                          date = f"{year}{month.zfill(2)}{day.zfill(2)}"
+                  
+                  if not date:
+                      # 現在の日付をフォールバックとして使用
+                      date = datetime.now().strftime("%Y%m%d")
+                  
+                  # オーディオURLを抽出
+                  audio_urls = extract_audio_urls_from_javascript(page_source)
+                  
+                  # 結果を表示
+                  print(f"タイトル: {title}")
+                  print(f"日付: {date}")
+                  print(f"オーディオURL数: {len(audio_urls)}")
+                  
+                  # オーディオURLの種類を判断
+                  mp3_urls = [url for url in audio_urls if '.mp3' in url.lower()]
+                  m3u8_urls = [url for url in audio_urls if '.m3u8' in url.lower()]
+                  
+                  episode_info = {
+                      "id": episode_id,
+                      "url": url,
+                      "title": title,
+                      "date": date,
+                      "audio_urls": audio_urls,
+                  }
+                  
+                  if mp3_urls:
+                      episode_info["type"] = "mp3"
+                      episode_info["mp3_urls"] = mp3_urls
+                      print(f"MP3 URL: {mp3_urls[0]}")
+                  elif m3u8_urls:
+                      episode_info["type"] = "m3u8"
+                      episode_info["m3u8_url"] = m3u8_urls[0]
+                      print(f"m3u8 URL: {m3u8_urls[0]}")
+                      
+                      # m3u8プレイリストからセグメントURLを取得
+                      segment_urls = get_m3u8_segments(m3u8_urls[0])
+                      episode_info["segment_urls"] = segment_urls
+                      print(f"セグメント数: {len(segment_urls)}")
+                  else:
+                      print(f"オーディオURLが見つかりませんでした")
+                      episode_info["type"] = "unknown"
+                  
+                  print(f"::endgroup::")
+                  return episode_info
+                  
+              except Exception as e:
+                  print(f"エピソード情報取得エラー: {e}")
+                  traceback.print_exc()
+                  if driver:
+                      save_debug_info(driver, url.split("/")[-1], "_error")
+                  print(f"::endgroup::")
+                  return None
+                  
+              finally:
+                  if driver:
+                      driver.quit()
+
+          def get_m3u8_segments(m3u8_url):
+              """m3u8プレイリストからセグメントURLを取得"""
+              try:
+                  print(f"m3u8プレイリストを取得中: {m3u8_url}")
+                  response = requests.get(m3u8_url, timeout=30)
+                  
+                  if response.status_code != 200:
+                      print(f"m3u8プレイリストの取得に失敗しました: ステータスコード {response.status_code}")
+                      return []
+                  
+                  # m3u8の内容を解析
+                  m3u8_content = response.text
+                  
+                  # ベースURLを取得
+                  base_url = m3u8_url.rsplit('/', 1)[0] + '/'
+                  
+                  # セグメントURLを抽出
+                  segment_urls = []
+                  for line in m3u8_content.splitlines():
+                      line = line.strip()
+                      if line and not line.startswith('#'):
+                          # 相対URLを絶対URLに変換
+                          if line.startswith('http'):
+                              segment_urls.append(line)
+                          else:
+                              segment_urls.append(base_url + line)
+                  
+                  print(f"m3u8プレイリストから{len(segment_urls)}個のセグメントURLを抽出しました")
+                  return segment_urls
+                  
+              except Exception as e:
+                  print(f"m3u8セグメント取得エラー: {e}")
+                  traceback.print_exc()
+                  return []
+
+          # MP3ファイルを結合する修正版関数
+          def concat_mp3_files(mp3_segments, output_mp3_path, temp_dir=TEMP_DIR):
+              """
+              MP3ファイルを結合する関数
+              
+              Args:
+                  mp3_segments: MP3セグメントファイルのリスト
+                  output_mp3_path: 出力先のMP3ファイルパス
+                  temp_dir: 一時ファイル用ディレクトリ
+              
+              Returns:
+                  bool: 成功した場合はTrue、失敗した場合はFalse
+              """
+              if not mp3_segments:
+                  print("結合するMP3セグメントがありません")
+                  return False
+              
+              # 絶対パスに変換
+              mp3_segments = [os.path.abspath(segment) for segment in mp3_segments if os.path.exists(segment)]
+              output_mp3_path = os.path.abspath(output_mp3_path)
+              
+              if not mp3_segments:
+                  print("有効なMP3セグメントが見つかりません")
+                  return False
+              
+              # MP3セグメントリストファイルを作成
+              mp3_segments_list = os.path.join(os.path.abspath(temp_dir), "mp3_segments.txt")
+              
+              try:
+                  # 方法1: ffmpegのconcatフィルターを使用
+                  with open(mp3_segments_list, 'w') as f:
+                      for segment in mp3_segments:
+                          # 絶対パスを使用し、エスケープ処理を追加
+                          # バックスラッシュのエスケープを修正
+                          segment_escaped = segment.replace('\\', '\\\\')
+                          segment_escaped = segment_escaped.replace("'", "\\'")
+                          segment_escaped = segment_escaped.replace(" ", "\\ ")
+                          f.write(f"file '{segment_escaped}'\n")
+                  
+                  print(f"MP3セグメントリストファイルを作成しました: {mp3_segments_list}")
+                  print(f"リストファイルの内容:")
+                  with open(mp3_segments_list, 'r') as f:
+                      print(f.read())
+                  
+                  # ffmpegコマンドを実行
+                  cmd = [
+                      'ffmpeg',
+                      '-f', 'concat',
+                      '-safe', '0',
+                      '-i', mp3_segments_list,
+                      '-c', 'copy',
+                      '-y',
+                      output_mp3_path
+                  ]
+                  
+                  print(f"FFmpegコマンドを実行: {' '.join(cmd)}")
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  
+                  if result.returncode == 0:
+                      print(f"MP3ファイルの結合に成功しました: {output_mp3_path}")
+                      if os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 0:
+                          return True
+                      else:
+                          print(f"出力ファイルが存在しないか、サイズが0です")
+                          return False
+                  else:
+                      print(f"MP3ファイルの結合に失敗しました: {result.stderr}")
+                      
+                      # 方法2: 代替方法を試す（catコマンドを使用）
+                      print("代替方法を試みます...")
+                      cat_cmd = ['cat'] + mp3_segments
+                      with open(output_mp3_path, 'wb') as outfile:
+                          result = subprocess.run(cat_cmd, stdout=outfile)
+                      
+                      if os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 0:
+                          print(f"代替方法でMP3ファイルの結合に成功しました: {output_mp3_path}")
+                          return True
+                      else:
+                          print(f"代替方法でもMP3ファイルの結合に失敗しました")
+                          return False
+                      
+              except Exception as e:
+                  print(f"MP3ファイル結合エラー: {e}")
+                  traceback.print_exc()
+                  return False
+
+          def download_m3u8_to_mp3(m3u8_url, mp3_path, episode_id):
+              """m3u8からMP3をダウンロード"""
+              print(f"::group::MP3ダウンロード")
+              print(f"オーディオURLからMP3をダウンロード中: {m3u8_url}")
+              print(f"出力先: {mp3_path}")
+              
+              try:
+                  # URLの拡張子を確認
+                  is_m3u8 = '.m3u8' in m3u8_url.lower()
+                  is_mp3 = '.mp3' in m3u8_url.lower()
+                  
+                  # MP3の場合は直接ダウンロード
+                  if is_mp3:
+                      print(f"MP3ファイルを直接ダウンロードします")
+                      try:
+                          response = requests.get(m3u8_url, timeout=30)
+                          if response.status_code == 200:
+                              with open(mp3_path, 'wb') as f:
+                                  f.write(response.content)
+                              
+                              if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                                  print(f"MP3ファイルのダウンロードに成功しました: {mp3_path}")
+                                  print(f"::endgroup::")
+                                  return mp3_path
+                              else:
+                                  print(f"ダウンロードしたMP3ファイルが存在しないか、サイズが0です")
+                          else:
+                              print(f"MP3ファイルのダウンロードに失敗しました: ステータスコード {response.status_code}")
+                      except Exception as e:
+                          print(f"MP3ダウンロードエラー: {e}")
+                          traceback.print_exc()
+                  
+                  # m3u8の場合はセグメントをダウンロードして結合
+                  elif is_m3u8:
+                      print(f"m3u8ファイルからセグメントをダウンロードします")
+                      
+                      # m3u8プレイリストからセグメントURLを取得
+                      segment_urls = get_m3u8_segments(m3u8_url)
+                      
+                      if not segment_urls:
+                          print(f"m3u8プレイリストからセグメントURLを取得できませんでした")
+                          print(f"::endgroup::")
+                          return None
+                      
+                      # セグメントをダウンロード
+                      segment_files = []
+                      for i, segment_url in enumerate(segment_urls):
+                          try:
+                              segment_file = os.path.join(TEMP_DIR, f"segment_{episode_id}_{i:03d}.ts")
+                              
+                              # セグメントをダウンロード
+                              response = requests.get(segment_url, timeout=30)
+                              if response.status_code == 200:
+                                  with open(segment_file, 'wb') as f:
+                                      f.write(response.content)
+                                  
+                                  if os.path.exists(segment_file) and os.path.getsize(segment_file) > 0:
+                                      segment_files.append(segment_file)
+                                      print(f"セグメント {i+1}/{len(segment_urls)} をダウンロードしました: {segment_file}")
+                                  else:
+                                      print(f"セグメント {i+1}/{len(segment_urls)} のダウンロードに失敗しました: ファイルが存在しないか、サイズが0です")
+                              else:
+                                  print(f"セグメント {i+1}/{len(segment_urls)} のダウンロードに失敗しました: ステータスコード {response.status_code}")
+                          except Exception as e:
+                              print(f"セグメント {i+1}/{len(segment_urls)} のダウンロードエラー: {e}")
+                              traceback.print_exc()
+                      
+                      print(f"ダウンロードしたセグメント数: {len(segment_files)}/{len(segment_urls)}")
+                      
+                      if not segment_files:
+                          print(f"セグメントをダウンロードできませんでした")
+                          print(f"::endgroup::")
+                          return None
+                      
+                      # セグメントを結合してMP3に変換
+                      try:
+                          # FFmpegコマンドを構築
+                          cmd = ['ffmpeg', '-i', 'concat:' + '|'.join(segment_files)]
+                          
+                          # 出力オプションを追加
+                          cmd.extend([
+                              '-c:a', 'libmp3lame',
+                              '-q:a', '2',
+                              '-y',  # 既存ファイルを上書き
+                              mp3_path
+                          ])
+                          
+                          print(f"FFmpegコマンドを実行: {' '.join(cmd)}")
+                          result = subprocess.run(cmd, capture_output=True, text=True)
+                          
+                          if result.returncode == 0:
+                              print(f"セグメントの結合とMP3変換に成功しました: {mp3_path}")
+                          else:
+                              print(f"セグメントの結合とMP3変換に失敗しました: {result.stderr}")
+                              
+                              # 代替方法を試す
+                              print("代替方法を試みます...")
+                              
+                              # 一時的なTSファイルを作成
+                              ts_file = os.path.join(TEMP_DIR, f"combined_{episode_id}.ts")
+                              
+                              # TSファイルを結合
+                              with open(ts_file, 'wb') as outfile:
+                                  for segment_file in segment_files:
+                                      with open(segment_file, 'rb') as infile:
+                                          outfile.write(infile.read())
+                              
+                              # TSファイルをMP3に変換
+                              cmd = [
+                                  'ffmpeg',
+                                  '-i', ts_file,
+                                  '-c:a', 'libmp3lame',
+                                  '-q:a', '2',
+                                  '-y',
+                                  mp3_path
+                              ]
+                              
+                              print(f"代替FFmpegコマンドを実行: {' '.join(cmd)}")
+                              result = subprocess.run(cmd, capture_output=True, text=True)
+                              
+                              if result.returncode != 0:
+                                  print(f"代替方法でもセグメントの結合とMP3変換に失敗しました: {result.stderr}")
+                                  print(f"::endgroup::")
+                                  return None
+                          
+                          # 一時ファイルを削除
+                          for segment_file in segment_files:
+                              try:
+                                  os.remove(segment_file)
+                              except:
+                                  pass
+                          
+                          if os.path.exists(ts_file):
+                              try:
+                                  os.remove(ts_file)
+                              except:
+                                  pass
+                          
+                          if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                              print(f"MP3ファイルの作成に成功しました: {mp3_path}")
+                              print(f"::endgroup::")
+                              return mp3_path
+                          else:
+                              print(f"MP3ファイルが存在しないか、サイズが0です")
+                              print(f"::endgroup::")
+                              return None
+                              
+                      except Exception as e:
+                          print(f"セグメント結合エラー: {e}")
+                          traceback.print_exc()
+                          print(f"::endgroup::")
+                          return None
+                  
+                  else:
+                      print(f"未対応のURLタイプです: {m3u8_url}")
+                      print(f"::endgroup::")
+                      return None
+                  
+              except Exception as e:
+                  print(f"MP3ダウンロードエラー: {e}")
+                  traceback.print_exc()
+                  print(f"::endgroup::")
+                  return None
+              
+              print(f"::endgroup::")
+              return None
+
+          def download_episode(episode):
+              """エピソードをダウンロード"""
+              print(f"::group::エピソード {episode['id']} のダウンロード")
+              print(f"エピソード情報: {episode}")
+              
+              # ファイル名の作成（日付_タイトル_ID.mp3）
+              episode_date = episode['date']
+              episode_title = episode['title']
+              episode_id = episode['id']
+              
+              # ファイル名に使用できない文字を置換
+              safe_title = re.sub(r'[\\/*?:"<>|]', '_', episode_title)
+              safe_title = safe_title[:50]  # タイトルの長さを制限
+              
+              # 有料放送かどうかを判断（デバッグ出力を強化）
+              is_premium = False
+              print(f"\n==== 有料放送判定開始: エピソードID {episode_id} ====")
+              print(f"エピソードURL: {episode['url']}")
+              
+              # 特定のエピソードIDを有料放送として明示的に判定（強制的に有料判定するバックアップ方法）
+              premium_episode_ids = [
+                  # ここに有料放送のエピソードIDを追加
+              ]
+              
+              if episode_id in premium_episode_ids:
+                  is_premium = True
+                  print(f"エピソードID {episode_id} は明示的に有料放送として判定されました")
+              
+              # ファイル名を決定
+              if is_premium:
+                  # 有料放送の場合は先頭にアンダースコアを付ける
+                  filename = f"_{safe_title}_{episode_id}.mp3"
+              else:
+                  # 無料放送の場合は日付を含める
+                  filename = f"{episode_date}_{safe_title}_{episode_id}.mp3"
+              
+              # 出力先のMP3ファイルパス
+              mp3_path = os.path.join(MP3_DIR, filename)
+              
+              # 既存のファイルをチェック
+              if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                  print(f"ファイルは既に存在します: {mp3_path}")
+                  print(f"::endgroup::")
+                  return mp3_path
+              
+              # オーディオURLを取得
+              if episode.get('type') == 'mp3' and episode.get('mp3_urls'):
+                  audio_url = episode['mp3_urls'][0]
+                  print(f"MP3 URL: {audio_url}")
+              elif episode.get('type') == 'm3u8' and episode.get('m3u8_url'):
+                  audio_url = episode['m3u8_url']
+                  print(f"m3u8 URL: {audio_url}")
+              else:
+                  print(f"オーディオURLが見つかりませんでした")
+                  print(f"::endgroup::")
+                  return None
+              
+              # MP3をダウンロード
+              mp3_file = download_m3u8_to_mp3(audio_url, mp3_path, episode_id)
+              
+              if mp3_file:
+                  print(f"エピソード {episode_id} のダウンロードに成功しました: {mp3_path}")
+                  print(f"::endgroup::")
+                  return mp3_path
+              else:
+                  print(f"エピソード {episode_id} のダウンロードに失敗しました")
+                  print(f"::endgroup::")
+                  return None
+
+          def main():
+              """メイン処理"""
+              print("Voicy MP3ダウンローダーを開始します")
+              
+              # 必要なディレクトリを作成
+              setup_directories()
+              
+              # FFmpegがインストールされているか確認
+              if not ensure_ffmpeg_installed():
+                  print("FFmpegがインストールされていないため、処理を中止します")
+                  return
+              
+              # ダウンロード履歴を読み込む
+              download_history = load_download_history()
+              print(f"ダウンロード履歴: {len(download_history)}件")
+              
+              # URLリストを読み込む
+              urls = load_urls_from_json()
+              
+              # 未ダウンロードのURLをフィルタリング
+              new_urls = [url for url in urls if url not in download_history]
+              print(f"未ダウンロードのURL: {len(new_urls)}件")
+              
+              # ダウンロード数を制限
+              urls_to_download = new_urls[:MAX_DOWNLOADS_PER_RUN]
+              print(f"今回ダウンロードするURL: {len(urls_to_download)}件")
+              
+              # 各URLからエピソードをダウンロード
+              downloaded_files = []
+              for url in urls_to_download:
+                  print(f"\n=== URLの処理: {url} ===")
+                  
+                  # エピソード情報を取得
+                  episode = get_episode_info(url)
+                  if not episode:
+                      print(f"エピソード情報の取得に失敗しました: {url}")
+                      continue
+                  
+                  # エピソードをダウンロード
+                  mp3_file = download_episode(episode)
+                  if mp3_file:
+                      download_history.append(url)
+                      downloaded_files.append(mp3_file)
+              
+              # ダウンロード結果を表示
+              print("\n=== ダウンロード結果 ===")
+              mp3_files = [f for f in os.listdir(MP3_DIR) if f.endswith('.mp3')]
+              for i, mp3_file in enumerate(mp3_files, 1):
+                  mp3_path = os.path.join(MP3_DIR, mp3_file)
+                  file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024) if os.path.exists(mp3_path) else 0
+                  
+                  # ファイル名から情報を抽出（新しいフォーマットに対応）
+                  # 有料放送（アンダーバー始まり）と無料放送の両方に対応
+                  if mp3_file.startswith('_'):
+                      # 有料放送: _タイトル_ID.mp3
+                      match = re.match(r'_(.+)_(\d+)\.mp3', mp3_file)
+                      if match:
+                          title, episode_id = match.groups()
+                          print(f"{i}. ID: {episode_id} [プレミアム]")
+                          print(f"   タイトル: {title}")
+                          print(f"   ファイル: {mp3_file}")
+                          print(f"   サイズ: {file_size_mb:.2f} MB")
+                  else:
+                      # 無料放送: 日付_タイトル_ID.mp3
+                      match = re.match(r'(\d+)_(.+)_(\d+)\.mp3', mp3_file)
+                      if match:
+                          date, title, episode_id = match.groups()
+                          print(f"{i}. ID: {episode_id}")
+                          print(f"   日付: {date}")
+                          print(f"   タイトル: {title}")
+                          print(f"   ファイル: {mp3_file}")
+                          print(f"   サイズ: {file_size_mb:.2f} MB")
+              
+              # ダウンロード履歴を保存
+              save_download_history(download_history)
+              print(f"ダウンロード履歴を保存しました: {len(download_history)}件")
+              
+              print("Voicy MP3ダウンローダーを終了します")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+      
+      - name: Voicy MP3ダウンロードスクリプト実行
+        run: |
+          python downloader.py
+      
+      - name: MP3ファイルリスト作成
+        run: |
+          mkdir -p mp3_downloads
+          find mp3_downloads -name "*.mp3" > mp3_files.txt
+          if [ -s mp3_files.txt ]; then
+            echo "ダウンロードされたMP3ファイル一覧:"
+            cat mp3_files.txt
+          else
+            echo "ダウンロードされたMP3ファイルはありません"
+          fi
+      
+      - name: MP3ファイルをコミット
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # mp3_downloadsディレクトリの存在確認
+          if [ -d "mp3_downloads" ]; then
+            MAIN_MP3_DIR="mp3_downloads"
+          else
+            # リポジトリルートにmp3_downloadsがない場合、検索して見つける
+            MAIN_MP3_DIR=$(find . -type d -name "mp3_downloads" | head -n 1)
+          fi
+          
+          if [ -z "$MAIN_MP3_DIR" ]; then
+              echo "mp3_downloadsディレクトリが見つかりません。カレントディレクトリを使用します。"
+              MAIN_MP3_DIR="."
+          fi
+          
+          echo "MP3ディレクトリ: $MAIN_MP3_DIR"
+          
+          # MP3ファイルの数を確認
+          MP3_COUNT=$(find "$MAIN_MP3_DIR" -name "*.mp3" | wc -l)
+          echo "MP3ファイル数: $MP3_COUNT"
+          
+          if [ $MP3_COUNT -gt 0 ]; then
+            # 変更をステージング
+            git add "$MAIN_MP3_DIR"/*.mp3
+            
+            # 変更があるか確認
+            if git diff --staged --quiet; then
+              echo "コミットする変更はありません"
+            else
+              # 変更をコミット
+              git commit -m "Add MP3 files: $(date +'%Y-%m-%d %H:%M:%S')"
+              
+              # 変更をプッシュ
+              git push
+              
+              echo "MP3ファイルをコミットしてプッシュしました"
+            fi
+          else
+            echo "コミットするMP3ファイルがありません"
+          fi
+      
+      - name: 実行結果の通知
+        run: |
+          echo "::notice::Voicy MP3ダウンロードが完了しました"
+          echo "::notice::MP3ファイルはリポジトリのmp3_downloadsディレクトリに保存されています"
