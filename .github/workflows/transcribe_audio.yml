@@ -1,0 +1,49 @@
+name: Transcribe Audio Files
+
+on:
+  schedule:
+    # 毎時0分に実行
+    - cron: '0 * * * *'
+  workflow_dispatch:  # 手動実行用
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install openai-whisper
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install ffmpeg-python
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Run transcription
+        run: |
+          python transcribe.py --mp3_dir mp3_downloads --text_dir mp3_text --limit 10 --model medium
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          
+          # 変更があるか確認
+          if [[ -n $(git status -s mp3_text) ]]; then
+            git add mp3_text/
+            timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+            git commit -m "Add transcriptions - $timestamp"
+            git push
+          else
+            echo "No new transcriptions to commit"
+          fi
